@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import pLimit from "p-limit";
 
 const execFileAsync = promisify(execFile);
 
@@ -31,93 +32,97 @@ if (files.length === 0) {
 
 console.log(`Found ${files.length} video(s) in ${inputDir}\n`);
 
-for (let i = 0; i < files.length; i++) {
-  const file = files[i];
-  const videoPath = join(inputDir, file);
-  const txtPath = join(inputDir, basename(file, extname(file)) + ".txt");
+const limit = pLimit(5);
 
-  // Skip if already transcribed
-  try {
-    await readFile(txtPath);
-    console.log(
-      `[${i + 1}/${files.length}] "${file}" — already transcribed, skipping`,
-    );
-    continue;
-  } catch {}
+const tasks = files.map((file, i) =>
+  limit(async () => {
+    const videoPath = join(inputDir, file);
+    const txtPath = join(inputDir, basename(file, extname(file)) + ".txt");
 
-  // Extract audio to a temp file with an ASCII-safe name
-  const tmpAudio = join(tmpdir(), `${randomUUID()}.mp3`);
-  console.log(`[${i + 1}/${files.length}] "${file}" — extracting audio...`);
-  await execFileAsync("ffmpeg", [
-    "-i",
-    videoPath,
-    "-vn",
-    "-acodec",
-    "libmp3lame",
-    "-ab",
-    "64k",
-    "-ar",
-    "22050",
-    "-ac",
-    "1",
-    "-y",
-    tmpAudio,
-  ]);
+    // Skip if already transcribed
+    try {
+      await readFile(txtPath);
+      console.log(
+        `[${i + 1}/${files.length}] "${file}" — already transcribed, skipping`,
+      );
+      return;
+    } catch {}
 
-  console.log(`  Uploading audio...`);
-  let uploaded;
-  try {
-    uploaded = await ai.files.upload({
-      file: tmpAudio,
-      config: { mimeType: "audio/mpeg", displayName: file },
+    // Extract audio to a temp file with an ASCII-safe name
+    const tmpAudio = join(tmpdir(), `${randomUUID()}.mp3`);
+    console.log(`[${i + 1}/${files.length}] "${file}" — extracting audio...`);
+    await execFileAsync("ffmpeg", [
+      "-i",
+      videoPath,
+      "-vn",
+      "-acodec",
+      "libmp3lame",
+      "-ab",
+      "64k",
+      "-ar",
+      "22050",
+      "-ac",
+      "1",
+      "-y",
+      tmpAudio,
+    ]);
+
+    console.log(`[${i + 1}/${files.length}] "${file}" — uploading audio...`);
+    let uploaded;
+    try {
+      uploaded = await ai.files.upload({
+        file: tmpAudio,
+        config: { mimeType: "audio/mpeg", displayName: file },
+      });
+    } finally {
+      await unlink(tmpAudio).catch(() => {});
+    }
+
+    // Wait for processing to complete
+    let fileState = uploaded;
+    while (fileState.state === "PROCESSING") {
+      await sleep(5000);
+      fileState = await ai.files.get({ name: fileState.name });
+    }
+
+    if (fileState.state === "FAILED") {
+      console.log(`[${i + 1}/${files.length}] "${file}" ✗ Processing failed, skipping`);
+      return;
+    }
+
+    console.log(`[${i + 1}/${files.length}] "${file}" — transcribing...`);
+
+    const response = await ai.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: [
+        {
+          role: "user",
+          parts: [
+            { fileData: { fileUri: fileState.uri, mimeType: "audio/mpeg" } },
+            {
+              text: "Transcribe all spoken words in this audio. Output ONLY the transcription text, nothing else. Keep the original language. If there are multiple speakers, start each speaker turn on a new line. If the line is too long, split it into multiple paragraphs in a logical way",
+            },
+          ],
+        },
+      ],
     });
-  } finally {
-    await unlink(tmpAudio).catch(() => {});
-  }
 
-  // Wait for processing to complete
-  let fileState = uploaded;
-  while (fileState.state === "PROCESSING") {
-    console.log(`  Processing...`);
-    await sleep(5000);
-    fileState = await ai.files.get({ name: fileState.name });
-  }
+    const transcription = response.text;
+    await writeFile(txtPath, transcription, "utf-8");
+    console.log(
+      `[${i + 1}/${files.length}] "${file}" ✓ saved (${transcription.length} chars)`,
+    );
 
-  if (fileState.state === "FAILED") {
-    console.log(`  ✗ Processing failed, skipping`);
-    continue;
-  }
+    // Clean up the uploaded file
+    try {
+      await ai.files.delete({ name: fileState.name });
+    } catch {}
+  }),
+);
 
-  console.log(`  Transcribing...`);
+await Promise.all(tasks);
 
-  const response = await ai.models.generateContent({
-    model: "gemini-2.5-flash",
-    contents: [
-      {
-        role: "user",
-        parts: [
-          { fileData: { fileUri: fileState.uri, mimeType: "audio/mpeg" } },
-          {
-            text: "Transcribe all spoken words in this audio. Output ONLY the transcription text, nothing else. Keep the original language. If there are multiple speakers, start each speaker turn on a new line.",
-          },
-        ],
-      },
-    ],
-  });
-
-  const transcription = response.text;
-  await writeFile(txtPath, transcription, "utf-8");
-  console.log(
-    `  ✓ Saved to ${basename(txtPath)} (${transcription.length} chars)\n`,
-  );
-
-  // Clean up the uploaded file
-  try {
-    await ai.files.delete({ name: fileState.name });
-  } catch {}
-}
-
-console.log("Done!");
+console.log("\nDone!");
 
 function mimeTypeFor(filename) {
   const ext = extname(filename).toLowerCase();
