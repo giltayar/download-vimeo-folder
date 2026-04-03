@@ -1,16 +1,29 @@
 {
   "name": "download-vimeo-folder",
   "version": "1.0.0",
-  "type": "module",
   "bin": {
-    "download-vimeo-folder": "./download-vimeo-folder.js"
+    "download-vimeo-folder": "./download-vimeo-folder.ts"
   },
+  "type": "module",
   "scripts": {
-    "postinstall": "npx playwright install chromium"
+    "postinstall": "playwright install chromium",
+    "format": "oxfmt --write .",
+    "test": "npm-run-all test:*",
+    "test:oxfmt": "oxfmt --check .",
+    "test:typescript": "tsgo --noEmit"
   },
   "dependencies": {
     "@google/genai": "^1.48.0",
     "p-limit": "^7.3.0",
     "playwright": "^1.50.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "@typescript/native-preview": "latest",
+    "npm-run-all": "^4.1.5",
+    "oxfmt": "^0.43.0"
+  },
+  "engines": {
+    "node": ">=24"
   }
 }
